@@ -1,0 +1,80 @@
+services:
+  otelcol:
+    image: otel/opentelemetry-collector:latest
+    container_name: otelcol
+    restart: unless-stopped
+    command: --config=/etc/otelcol/config.yaml
+    environment:
+      - HOSTNAME=${HOSTNAME} # Falls back to 'nebula' if $HOSTNAME is unset
+    networks:
+      - monitoring-front
+      - monitoring-back
+    depends_on:
+      - prometheus
+    volumes:
+      - ./configs/otelcol/otelcol.yaml:/etc/otelcol/config.yaml
+
+  alloy:
+    image: grafana/alloy:latest
+    container_name: alloy
+    environment:
+      - HOSTNAME=${HOSTNAME}
+    volumes:
+      - ./configs/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/log:/var/log:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy-data:/var/lib/alloy/data
+    networks:
+      - monitoring-back
+
+
+  node-exporter:
+    image: quay.io/prometheus/node-exporter:latest
+    container_name: node-exporter
+    restart: unless-stopped
+    networks: 
+      - monitoring-back
+    volumes:
+      - '/:/host:ro,rslave'
+      - '/sys:/host/sys:ro' # Mount host sysfs into the container
+    command:
+      - '--path.rootfs=/host'
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+
+
+  cadvisor-exporter:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: cadvisor-exporter
+    restart: unless-stopped
+    volumes: 
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+        # https://github.com/google/cadvisor/issues/1565#issuecomment-718812180
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /dev/disk:/dev/disk:ro
+    devices: 
+      - "/dev/kmsg"
+    networks:
+      - monitoring-back
+
+
+  dcgm-exporter:
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:latest
+    container_name: dcgm-exporter
+    restart: unless-stopped
+    environment:
+      - DCGM_EXPORTER_INTERVAL=500
+    cap_add:
+      - SYS_ADMIN
+    networks:
+      - monitoring-back
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
