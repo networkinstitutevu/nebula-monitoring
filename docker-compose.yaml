@@ -1,0 +1,170 @@
+networks:
+  socket-net:
+    name: socket-net
+    driver: bridge
+    internal: true
+  ingress-net:
+    name: ingress-net
+    driver: bridge
+  monitoring-front:
+    name: monitoring-front
+    driver: bridge
+    internal: true
+  monitoring-back:
+    name: monitoring-back
+    driver: bridge
+    internal: true
+
+
+volumes:
+  grafana-data:
+    name: grafana-data
+  prom-data:
+    name: prom-data
+  alloy-data:
+    name: alloy-data
+
+
+services:
+  socket-proxy:
+    image: lscr.io/linuxserver/socket-proxy:latest
+    container_name: socket-proxy
+    restart: unless-stopped
+    environment:
+      - CONTAINERS=1
+      - SERVICES=1
+      - TASKS=1
+    networks:
+      - socket-net
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+
+  traefik:
+    image: traefik:v3.7.12
+    restart: unless-stopped
+    container_name: traefik
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - ingress-net
+      - socket-net
+      - monitoring-front
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/traefik/certs/:/var/traefik/certs/
+    depends_on:
+      - socket-proxy
+    logging:
+      driver: 'json-file'
+      options:
+        max-size: '20m'
+        max-file: '3'
+        tag: "{{.Name}}"
+    command:
+      - "--global.checkNewVersion=false"
+      - "--global.sendAnonymousUsage=false"
+      - "--log.level=DEBUG"
+
+      - "--providers.docker=true"
+      - "--providers.docker.exposedByDefault=false"
+      - "--providers.docker.endpoint=tcp://socket-proxy:2375"
+      - "--providers.docker.network=ingress-net"
+
+      # Entrypoints
+      - "--entrypoints.monitoring-web.address=:80"
+      - "--entrypoints.monitoring-websecure.address=:443"
+
+      # Internal Metrics Entrypoint
+      ## Prometheus config
+      - "--entryPoints.metrics.address=:8082"
+      - "--metrics.prometheus=true"
+      - "--metrics.prometheus.entryPoint=metrics"
+      - "--metrics.prometheus.addEntryPointsLabels=true"
+      - "--metrics.prometheus.addServicesLabels=true"
+
+      # Global HTTP to HTTPS redirect
+      - "--entrypoints.monitoring-web.http.redirections.entrypoint.to=monitoring-websecure"
+      - "--entrypoints.monitoring-web.http.redirections.entrypoint.scheme=https"
+
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    env_file:
+      - path: ./envs/grafana.env
+        required: true
+    networks:
+      - ingress-net
+      - monitoring-front
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./configs/grafana/provisioning:/etc/grafana/provisioning
+      - ./configs/grafana/dashboards:/var/lib/grafana/dashboards
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.rule=${TRAEFIK_GRAFANA_HOST}"
+      - "traefik.http.services.grafana.loadbalancer.server.port=${TRAEFIK_GRAFANA_PORT}"
+      - "traefik.http.routers.grafana.entrypoints=monitoring-websecure"
+      - "traefik.http.routers.grafana.tls=true"
+      # - "traefik.http.middlewares.ip-allowlist-grafana.ipallowlist.sourcerange=${IP_ALLOW_LIST_GRAFANA}"
+      # - "traefik.http.routers.grafana.middlewares=ip-allowlist-grafana"
+
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    networks:
+      - ingress-net
+      - monitoring-front
+      - monitoring-back
+    command:
+      - --config.file=/etc/prometheus/prometheus.yaml
+      - --storage.tsdb.path=/prometheus
+      - --web.console.libraries=/usr/share/prometheus/console_libraries
+      - --web.console.templates=/usr/share/prometheus/consoles
+      - --storage.tsdb.retention.time=90d
+      - --web.enable-remote-write-receiver
+    volumes:
+      - ./configs/prometheus/prometheus.yaml:/etc/prometheus/prometheus.yaml
+      - prom-data:/prometheus
+    labels:
+      - "traefik.enable=true"
+      # Route /prometheus/api/v1/write and strip /prometheus before forwarding to Prometheus
+      - "traefik.http.routers.prometheus.rule=${TRAEFIK_PROMETHEUS_HOST}"
+      - "traefik.http.routers.prometheus.entrypoints=monitoring-websecure"
+      - "traefik.http.services.prometheus.loadbalancer.server.port=9090"
+      - "traefik.http.routers.prometheus.tls=true"
+      - "traefik.http.middlewares.prom-strip.stripprefix.prefixes=/prometheus"
+      - "traefik.http.middlewares.prom-auth.basicauth.users=${PROMETHEUS_AUTH}"
+      - "traefik.http.middlewares.ip-allowlist.ipallowlist.sourcerange=${IP_ALLOW_LIST}"
+      - "traefik.http.routers.prometheus.middlewares=prom-strip,prom-auth,ip-allowlist"
+
+
+  loki:
+    image: grafana/loki:3.1.0
+    container_name: loki
+    volumes:
+      - ./configs/loki/loki.yaml:/etc/loki/loki.yml
+      - ${LOKI_VOLUME}:/tmp/loki
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki.yml
+    networks:
+      - ingress-net
+      - monitoring-front
+      - monitoring-back
+    labels:
+      - "traefik.enable=true"
+      # Exposes log push endpoint natively at /loki/api/v1/push
+      - "traefik.http.routers.loki.rule=${TRAEFIK_LOKI_HOST}"
+      - "traefik.http.routers.loki.entrypoints=monitoring-websecure"
+      - "traefik.http.services.loki.loadbalancer.server.port=3100"
+      - "traefik.http.routers.loki.tls=true"
+      - "traefik.http.middlewares.loki-auth.basicauth.users=${LOKI_AUTH}"
+      - "traefik.http.middlewares.ip-allowlist.ipallowlist.sourcerange=${IP_ALLOW_LIST}"
+      - "traefik.http.routers.loki.middlewares=loki-auth,ip-allowlist"
+
